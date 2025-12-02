@@ -2,6 +2,7 @@
 require('dotenv').config();
 const express = require('express');
 const fetch = require('node-fetch');
+const crypto = require('crypto');
 const app = express();
 
 const UPSTREAM = process.env.SOURCE_API;
@@ -9,8 +10,67 @@ const UPSTREAM_USER = process.env.SOURCE_USER;
 const UPSTREAM_PASS = process.env.SOURCE_PASS;
 const PORT = process.env.PORT || 3000;
 
-// Basic Auth header
-const basicAuthHeader = 'Basic ' + Buffer.from(`${UPSTREAM_USER}:${UPSTREAM_PASS}`).toString('base64');
+// OData incoming auth credentials (protects clients calling /odata/*)
+const ODATA_USER = process.env.ODATA_USER; // e.g. set in .env
+const ODATA_PASS = process.env.ODATA_PASS;
+
+const basicAuthHeaderForUpstream = UPSTREAM_USER && UPSTREAM_PASS
+  ? 'Basic ' + Buffer.from(`${UPSTREAM_USER}:${UPSTREAM_PASS}`).toString('base64')
+  : null;
+
+// helper: safe equals (prevents timing attacks) for Buffers
+function safeEqual(a, b) {
+  try {
+    const bufA = Buffer.from(String(a));
+    const bufB = Buffer.from(String(b));
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+// Middleware: require Basic Auth for /odata routes when ODATA_USER/ODATA_PASS are present
+function requireBasicAuth(req, res, next) {
+  // If no ODATA credentials configured, skip auth (but log)
+  if (!ODATA_USER || !ODATA_PASS) {
+    console.warn('ODATA_USER/ODATA_PASS not set — skipping incoming OData Basic Auth (not recommended for production).');
+    return next();
+  }
+
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Basic ')) {
+    res.set('WWW-Authenticate', 'Basic realm="OData"');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const base64Cred = auth.slice('Basic '.length);
+  let decoded;
+  try {
+    decoded = Buffer.from(base64Cred, 'base64').toString('utf8');
+  } catch (e) {
+    res.set('WWW-Authenticate', 'Basic realm="OData"');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const split = decoded.split(':');
+  const user = split.shift();
+  const pass = split.join(':'); // allow colons in password
+
+  // perform timing-safe comparison
+  if (safeEqual(user, ODATA_USER) && safeEqual(pass, ODATA_PASS)) {
+    return next();
+  } else {
+    res.set('WWW-Authenticate', 'Basic realm="OData"');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+// Attach auth middleware to OData routes
+app.use('/odata', requireBasicAuth);
+
+
+// --- existing proxy implementation below ---
 
 // Normalize data types from sample API
 function normalizeItem(item) {
@@ -59,13 +119,18 @@ app.get('/odata/Transactions', async (req, res) => {
 
     const upstreamUrl = UPSTREAM;
 
+    // add a short timeout using AbortController to avoid long hangs
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s
+
     const response = await fetch(upstreamUrl, {
       method: "GET",
       headers: {
-        Authorization: basicAuthHeader,
+        ...(basicAuthHeaderForUpstream ? { Authorization: basicAuthHeaderForUpstream } : {}),
         Accept: "application/json"
-      }
-    });
+      },
+      signal: controller.signal
+    }).finally(() => clearTimeout(timeoutId));
 
     if (!response.ok) {
       return res.status(500).json({ error: "Upstream API error", status: response.status });
@@ -118,6 +183,9 @@ app.get('/odata/Transactions', async (req, res) => {
     res.json(odataResponse);
   } catch (error) {
     console.error("ERROR:", error);
+    if (error.name === 'AbortError') {
+      return res.status(504).json({ error: 'Upstream timeout' });
+    }
     res.status(500).json({ error: error.message });
   }
 });
